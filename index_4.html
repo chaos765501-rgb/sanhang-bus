@@ -1,0 +1,675 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>산행산악회 주왕산 버스 예약</title>
+
+  <!-- ① Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- ② React 18 UMD -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+
+  <!-- ③ Babel Standalone (JSX 변환) -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- ④ 커스텀 CSS -->
+  <style>
+    @keyframes scale-up {
+      from { transform: scale(0.92); opacity: 0; }
+      to   { transform: scale(1);    opacity: 1; }
+    }
+    .animate-scale-up { animation: scale-up 0.18s ease-out; }
+    .bg-diagonal-stripes {
+      background-image: repeating-linear-gradient(
+        45deg, transparent, transparent 4px,
+        rgba(148,163,184,0.25) 4px, rgba(148,163,184,0.25) 8px
+      );
+    }
+  </style>
+</head>
+<body>
+  <!-- ⑤ React 렌더링 진입점 -->
+  <div id="root"></div>
+
+  <!-- ⑥ Firebase ESM → window.__fb 전역 등록 -->
+  <script type="module">
+    import { initializeApp }
+      from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
+    import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken }
+      from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
+    import { getFirestore, doc, onSnapshot, setDoc, updateDoc }
+      from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+
+    window.__fb = {
+      initializeApp,
+      getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken,
+      getFirestore, doc, onSnapshot, setDoc, updateDoc
+    };
+    window.dispatchEvent(new Event('firebase-ready'));
+  </script>
+
+  <!-- ⑦ 앱 본체 -->
+  <script type="text/babel" data-presets="react">
+    const { useState, useEffect, useRef } = React;
+    const {
+      initializeApp, getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken,
+      getFirestore, doc, onSnapshot, setDoc, updateDoc
+    } = window.__fb;
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyA1G1pJnf_SJJW0VcXAY5r2eDbYikHrx8Q",
+      authDomain: "sanhang-bus-seat-book.firebaseapp.com",
+      projectId: "sanhang-bus-seat-book",
+      storageBucket: "sanhang-bus-seat-book.firebasestorage.app",
+      messagingSenderId: "787088489197",
+      appId: "1:787088489197:web:4a1ee0ef0a9e0b82c12ae4"
+    };
+
+    const isLocalDemo = !firebaseConfig.apiKey || firebaseConfig.apiKey.includes("Fake") || firebaseConfig.apiKey === "";
+    const app   = initializeApp(firebaseConfig);
+    const auth  = getAuth(app);
+    const db    = getFirestore(app);
+    const appId = 'mountain-club-bus-19';
+
+    const defaultMembers = Array.from({ length: 16 }, (_, i) => ({ seq: i+1, name: `${i+1}번 회원`, seat: null }));
+    const initialSeatsState = {};
+    for (let i = 1; i <= 19; i++) initialSeatsState[i] = { occupiedBy: null, seq: null, blocked: false };
+
+    function App() {
+      const [user, setUser]                   = useState(null);
+      const [loading, setLoading]             = useState(true);
+      const [errorMsg, setErrorMsg]           = useState('');
+      const [forceDemoMode, setForceDemoMode] = useState(isLocalDemo);
+      const [dbState, setDbState] = useState({
+        currentTurn: 1, members: defaultMembers, seats: initialSeatsState,
+        customShareUrl: "", timerDuration: 60, timerEnd: null
+      });
+      const [timeLeft, setTimeLeft]           = useState(60);
+      const [mySeq, setMySeq]                 = useState(() => { const s = localStorage.getItem('my_seq'); return s ? parseInt(s) : null; });
+      const [isAdminMode, setIsAdminMode]     = useState(false);
+      const [isEditingNames, setIsEditingNames] = useState(false);
+      const [tempNames, setTempNames]         = useState({});
+      const [tempShareUrl, setTempShareUrl]   = useState("");
+      const [tempHours, setTempHours]         = useState(0);
+      const [tempMinutes, setTempMinutes]     = useState(1);
+      const [tempSeconds, setTempSeconds]     = useState(0);
+      const [adminPassword, setAdminPassword]         = useState(() => localStorage.getItem('admin_password') || '1234');
+      const [showPasswordModal, setShowPasswordModal] = useState(false);
+      const [passwordInput, setPasswordInput]         = useState('');
+      const [passwordError, setPasswordError]         = useState(false);
+      const [tempAdminPassword, setTempAdminPassword] = useState('');
+      const [tempAdminPasswordConfirm, setTempAdminPasswordConfirm] = useState('');
+      const [showResetModal, setShowResetModal]   = useState(false);
+      const [showCancelModal, setShowCancelModal] = useState(false);
+      const [showConfirmModal, setShowConfirmModal] = useState(false);
+      const [targetCancelSeat, setTargetCancelSeat]   = useState(null);
+      const [targetConfirmSeat, setTargetConfirmSeat] = useState(null);
+      const [notification, setNotification]   = useState(null);
+      const isSkipping = useRef(false);
+
+      const triggerNotification = (message, type = 'info') => {
+        setNotification({ message, type });
+        setTimeout(() => setNotification(null), 4000);
+      };
+
+      const formatTimeLeft = (seconds) => {
+        if (seconds <= 0) return "시간 초과";
+        const h = Math.floor(seconds / 3600), m = Math.floor((seconds % 3600) / 60), s = seconds % 60;
+        let r = '';
+        if (h > 0) r += `${h}시간 `;
+        if (m > 0 || h > 0) r += `${m}분 `;
+        return r + `${s}초`;
+      };
+
+      useEffect(() => {
+        const initAuth = async () => {
+          try { await signInAnonymously(auth); }
+          catch (err) {
+            setErrorMsg("파이어베이스 콘솔에서 '익명 로그인'을 허용(On)해주시거나, 로컬 세션 모드로 안전하게 부팅합니다.");
+            setForceDemoMode(true); setLoading(false);
+          }
+        };
+        initAuth();
+        const unsub = onAuthStateChanged(auth, (u) => { if (u) setUser(u); });
+        return () => unsub && unsub();
+      }, [forceDemoMode]);
+
+      useEffect(() => {
+        if (forceDemoMode || !user || !db) return;
+        const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'busState', 'status');
+        setLoading(true);
+        const unsub = onSnapshot(docRef,
+          (snap) => {
+            if (snap.exists()) {
+              const data = snap.data();
+              setDbState(prev => ({
+                ...prev, ...data,
+                members: data.members?.length > 0 ? data.members : defaultMembers,
+                seats: { ...initialSeatsState, ...data.seats }
+              }));
+            } else {
+              const def = { currentTurn:1, members:defaultMembers, seats:initialSeatsState, customShareUrl:"", timerDuration:60, timerEnd:Date.now()+60000 };
+              setDoc(docRef, def).then(() => setDbState(def)).catch(console.error);
+            }
+            setLoading(false);
+          },
+          (err) => { setErrorMsg("데이터를 가져오는 도중 오류가 발생했습니다. 권한을 확인해주세요."); setLoading(false); }
+        );
+        return () => unsub();
+      }, [user, forceDemoMode]);
+
+      useEffect(() => {
+        if (dbState.currentTurn > 16 || !dbState.timerEnd) { setTimeLeft(0); return; }
+        const interval = setInterval(() => {
+          const rem = Math.max(0, Math.ceil((dbState.timerEnd - Date.now()) / 1000));
+          setTimeLeft(rem);
+          if (rem <= 0 && !isSkipping.current) { clearInterval(interval); handleAutoSkipTrigger(); }
+        }, 1000);
+        return () => clearInterval(interval);
+      }, [dbState.timerEnd, dbState.currentTurn]);
+
+      const startEditingNames = () => {
+        const names = {}; dbState.members.forEach(m => { names[m.seq] = m.name; });
+        const t = dbState.timerDuration || 60;
+        setTempNames(names); setTempShareUrl(dbState.customShareUrl || "");
+        setTempHours(Math.floor(t/3600)); setTempMinutes(Math.floor((t%3600)/60)); setTempSeconds(t%60);
+        setTempAdminPassword('');
+        setTempAdminPasswordConfirm('');
+        setIsEditingNames(true);
+      };
+
+      const saveEditedNames = async () => {
+        if (tempAdminPassword) {
+          if (tempAdminPassword !== tempAdminPasswordConfirm) {
+            triggerNotification("새 비밀번호가 일치하지 않습니다. 다시 확인해 주세요.", "error"); return;
+          }
+          if (tempAdminPassword.length < 4) {
+            triggerNotification("비밀번호는 4자리 이상이어야 합니다.", "error"); return;
+          }
+          setAdminPassword(tempAdminPassword);
+          localStorage.setItem('admin_password', tempAdminPassword);
+        }
+        const updatedMembers = dbState.members.map(m => ({ ...m, name: tempNames[m.seq] || m.name }));
+        let totalSec = (parseInt(tempHours)*3600)+(parseInt(tempMinutes)*60)+parseInt(tempSeconds);
+        if (isNaN(totalSec)||totalSec<=0) totalSec=60;
+        if (totalSec>43200) totalSec=43200;
+        const newStateBase = { ...dbState, members:updatedMembers, customShareUrl:tempShareUrl, timerDuration:totalSec, timerEnd:Date.now()+totalSec*1000 };
+        if (forceDemoMode) {
+          setDbState(newStateBase); localStorage.setItem('local_bus_state_v2', JSON.stringify(newStateBase));
+          setIsEditingNames(false); triggerNotification("회원 명단 및 타이머가 임시 업데이트되었습니다.", "success"); return;
+        }
+        if (!user) return;
+        try {
+          await updateDoc(doc(db,'artifacts',appId,'public','data','busState','status'), { members:updatedMembers, customShareUrl:tempShareUrl, timerDuration:totalSec, timerEnd:Date.now()+totalSec*1000 });
+          setIsEditingNames(false); triggerNotification("회원 명단 및 타이머 제한이 실시간으로 업데이트되었습니다!", "success");
+        } catch { triggerNotification("업데이트에 실패했습니다.", "error"); }
+      };
+
+      const handleSelectMyIdentity = (seq) => {
+        setMySeq(seq); localStorage.setItem('my_seq', seq);
+        const m = dbState.members.find(m => m.seq === seq);
+        triggerNotification(`반갑습니다, ${m ? m.name : `${seq}번 회원`}님으로 설정되었습니다!`, "success");
+      };
+
+      const handleLogout = () => { setMySeq(null); localStorage.removeItem('my_seq'); triggerNotification("사용자 설정이 해제되었습니다."); };
+
+      const handleCopyBandShareLink = () => {
+        const finalUrl = dbState.customShareUrl?.trim() || window.location.href;
+        const activeMember = dbState.members.find(m => m.seq === dbState.currentTurn);
+        const nextTurnText = activeMember ? `현재 [${dbState.currentTurn}번: ${activeMember.name}] 회원님 선택 차례입니다!` : "모든 예약이 완료되었습니다! 🎉";
+        const shareText = `[산행산악회] 주왕산 대절 버스 좌석 실시간 예약 안내\n\n📌 본인의 예약 순서가 되면 아래 링크에 접속하여 자리를 선택해 주세요!\n📢 ${nextTurnText}\n\n👇 실시간 좌석 예약 바로가기\n${finalUrl}`;
+        navigator.clipboard.writeText(shareText).then(() => {
+          triggerNotification(dbState.customShareUrl ? "밴드 초대 메시지가 복사되었습니다! 채팅방에 붙여넣기 하세요. 📋" : "임시 개발 주소로 복사되었습니다. 실제 배포 후 '명단 수정'에서 진짜 주소를 등록해 주세요!", dbState.customShareUrl ? "success" : "warning");
+        }).catch(() => triggerNotification("복사에 실패했습니다. 주소창의 URL을 직접 복사해주세요.", "error"));
+      };
+
+      const handleToggleBlockSeat = async (seatNumber) => {
+        const seatObj = dbState.seats[seatNumber] || { occupiedBy:null, seq:null, blocked:false };
+        if (seatObj.occupiedBy) { triggerNotification("이미 예약이 완료된 좌석입니다.", "warning"); return; }
+        const updatedSeats = { ...dbState.seats, [seatNumber]: { ...seatObj, blocked: !seatObj.blocked } };
+        if (forceDemoMode) {
+          const ns = { ...dbState, seats: updatedSeats }; setDbState(ns); localStorage.setItem('local_bus_state_v2', JSON.stringify(ns));
+          triggerNotification(`${seatNumber}번 좌석 잠금 상태 변경(로컬)`, "success"); return;
+        }
+        if (!user) return;
+        try {
+          await updateDoc(doc(db,'artifacts',appId,'public','data','busState','status'), { seats: updatedSeats });
+          triggerNotification(`${seatNumber}번 좌석이 ${!seatObj.blocked?'잠금 처리':'잠금 해제'}되었습니다.`, "success");
+        } catch { triggerNotification("좌석 상태 변경에 실패했습니다.", "error"); }
+      };
+
+      const handleSkipTurn = async () => {
+        const seated = dbState.members.filter(m => m.seat !== null);
+        const unseated = dbState.members.filter(m => m.seat === null);
+        if (unseated.length <= 1) { triggerNotification("다음으로 건너뛸 수 있는 다른 대기 회원이 없습니다.", "warning"); return; }
+        const [skipped, next, ...rest] = unseated;
+        const reordered = [next, skipped, ...rest];
+        const startSeq = dbState.currentTurn;
+        const updatedMembers = [...seated, ...reordered.map((m,i) => ({ ...m, seq: startSeq+i }))].sort((a,b) => a.seq-b.seq);
+        const newTimerEnd = Date.now() + (dbState.timerDuration||60)*1000;
+        if (forceDemoMode) {
+          const ns = { ...dbState, members:updatedMembers, timerEnd:newTimerEnd }; setDbState(ns); localStorage.setItem('local_bus_state_v2', JSON.stringify(ns));
+          triggerNotification(`⏳ [${skipped.name}] 회원님 무응답 지연 패스(로컬)`, "warning"); return;
+        }
+        if (!user || isSkipping.current) return;
+        isSkipping.current = true;
+        try {
+          await updateDoc(doc(db,'artifacts',appId,'public','data','busState','status'), { members:updatedMembers, timerEnd:newTimerEnd });
+          triggerNotification(`⏳ [${skipped.name}] 회원님이 무응답 지연으로 1순번 밀려나 [${next.name}]님 다음 차례가 되었습니다.`, "warning");
+        } catch { triggerNotification("건너뛰기 처리 중 오류가 발생했습니다.", "error"); }
+        finally { isSkipping.current = false; }
+      };
+
+      const handleAutoSkipTrigger = () => {
+        const delay = (mySeq === dbState.currentTurn || isAdminMode) ? 0 : 1500 + Math.random()*1000;
+        setTimeout(() => { if (timeLeft <= 0) handleSkipTurn(); }, delay);
+      };
+
+      const handleCancelReservation = async () => {
+        const seatNum = targetCancelSeat;
+        const seatObj = dbState.seats[seatNum];
+        if (!seatObj?.occupiedBy) { triggerNotification("취소할 수 없는 좌석입니다.", "error"); setShowCancelModal(false); return; }
+        const targetSeq = seatObj.seq;
+        const myInfo = dbState.members.find(m => m.seq === targetSeq);
+        if (!myInfo) { triggerNotification("회원 정보 매핑에 실패했습니다.", "error"); setShowCancelModal(false); return; }
+        const newSeats = { ...dbState.seats, [seatNum]: { occupiedBy:null, seq:null, blocked:false } };
+        const newMembers = dbState.members.map(m => m.seq===targetSeq ? { ...m, seat:null } : m);
+        const nextTimerEnd = Date.now() + (dbState.timerDuration||60)*1000;
+        if (forceDemoMode) {
+          const ns = { ...dbState, seats:newSeats, members:newMembers, currentTurn:targetSeq, timerEnd:nextTimerEnd };
+          setDbState(ns); localStorage.setItem('local_bus_state_v2', JSON.stringify(ns));
+          setShowCancelModal(false); triggerNotification(`${seatNum}번 좌석 취소 완료(로컬)`, "success"); return;
+        }
+        if (!user) return;
+        try {
+          await updateDoc(doc(db,'artifacts',appId,'public','data','busState','status'), { seats:newSeats, members:newMembers, currentTurn:targetSeq, timerEnd:nextTimerEnd });
+          const finalUrl = dbState.customShareUrl?.trim() || window.location.href;
+          const chatText = `🚌 *[산행산악회 버스 예약 취소]*\n\n📌 *${myInfo.name}* 회원님이 버스 *${seatNum}번 좌석* 지정을 취소하고 대기 상태로 복구하셨습니다!\n\n📢 현재 차례인 *${myInfo.name}*님은 아래 링크에서 다시 예약을 진행해 주세요!\n🔗 ${finalUrl}`;
+          navigator.clipboard.writeText(chatText).catch(()=>{});
+          setShowCancelModal(false); triggerNotification(`${seatNum}번 좌석 예약이 철회되었습니다. 단체방 공유 메시지가 복사되었습니다!`, "success");
+        } catch { triggerNotification("처리 중 오류가 발생했습니다.", "error"); }
+      };
+
+      const handleConfirmReservation = async () => {
+        if (targetConfirmSeat === null) return;
+        const seatNumber = targetConfirmSeat;
+        const myInfo = dbState.members.find(m => m.seq === mySeq);
+        const seatObj = dbState.seats[seatNumber] || { occupiedBy:null, seq:null, blocked:false };
+        const newSeats = { ...dbState.seats, [seatNumber]: { ...seatObj, occupiedBy:myInfo.name, seq:mySeq } };
+        const newMembers = dbState.members.map(m => m.seq===mySeq ? { ...m, seat:seatNumber } : m);
+        const nextTurn = dbState.currentTurn + 1;
+        const nextTimerEnd = Date.now() + (dbState.timerDuration||60)*1000;
+        if (forceDemoMode) {
+          const ns = { ...dbState, seats:newSeats, members:newMembers, currentTurn:nextTurn, timerEnd:nextTimerEnd };
+          setDbState(ns); localStorage.setItem('local_bus_state_v2', JSON.stringify(ns));
+          setShowConfirmModal(false); setTargetConfirmSeat(null); triggerNotification(`${seatNumber}번 좌석 선택 완료(로컬)`, "success"); return;
+        }
+        try {
+          await updateDoc(doc(db,'artifacts',appId,'public','data','busState','status'), { seats:newSeats, members:newMembers, currentTurn:nextTurn, timerEnd:nextTimerEnd });
+          const nextMember = newMembers.find(m => m.seq===nextTurn);
+          const nextInfoText = nextMember ? `📢 다음 차례 [${nextTurn}번: ${nextMember.name}] 회원님은 아래 링크에서 자리를 골라주세요!` : "🎉 명품 주왕산 대절 버스 모든 회원 예약이 축제처럼 완료되었습니다!";
+          const finalUrl = dbState.customShareUrl?.trim() || window.location.href;
+          const chatText = `🚌 *[산행산악회 버스 예약 알림]*\n\n📌 *${myInfo.name}* 회원님이 버스 *${seatNumber}번 좌석* 예약을 마쳤습니다!\n\n${nextInfoText}\n🔗 ${finalUrl}`;
+          navigator.clipboard.writeText(chatText).catch(()=>{});
+          setShowConfirmModal(false); setTargetConfirmSeat(null); triggerNotification(`${seatNumber}번 좌석 확정 완료! 대화방에 붙여넣기(전송)할 수 있게 안내 메시지가 복사되었습니다.`, "success");
+        } catch { triggerNotification("처리 중 오류가 발생했습니다.", "error"); }
+      };
+
+      const handleSeatClick = async (seatNumber) => {
+        if (isAdminMode) { await handleToggleBlockSeat(seatNumber); return; }
+        const seatObj = dbState.seats[seatNumber] || { occupiedBy:null, seq:null, blocked:false };
+        if (seatObj.blocked) { triggerNotification("해당 좌석은 대절 버스 사정으로 사용할 수 없는 좌석입니다.", "error"); return; }
+        if (!mySeq) { triggerNotification("먼저 좌측 명단에서 본인의 성함(순번)을 꼭 선택해 주세요!", "warning"); return; }
+        if (seatObj.seq === mySeq) { setTargetCancelSeat(seatNumber); setShowCancelModal(true); return; }
+        if (dbState.currentTurn !== mySeq) {
+          const cur = dbState.members.find(m => m.seq===dbState.currentTurn);
+          triggerNotification(`지금은 [${cur ? cur.name : `${dbState.currentTurn}번`}]님의 선택 차례입니다.`, "warning"); return;
+        }
+        const myInfo = dbState.members.find(m => m.seq===mySeq);
+        if (myInfo?.seat !== null) { triggerNotification("이미 좌석을 지정하셨습니다! 취소 후 다른 자리를 터치해 주세요.", "warning"); return; }
+        if (seatObj.occupiedBy !== null) { triggerNotification("이미 다른 회원님이 선택하신 좌석입니다.", "error"); return; }
+        setTargetConfirmSeat(seatNumber); setShowConfirmModal(true);
+      };
+
+      const handleReset = async () => {
+        const duration = dbState.timerDuration || 60;
+        const baseReset = { currentTurn:1, members:dbState.members.map(m=>({...m,seat:null})), seats:initialSeatsState, customShareUrl:dbState.customShareUrl||"", timerDuration:duration, timerEnd:Date.now()+duration*1000 };
+        if (forceDemoMode) {
+          setDbState(baseReset); localStorage.setItem('local_bus_state_v2', JSON.stringify(baseReset));
+          setShowResetModal(false); triggerNotification("로컬 데이터가 완전히 리셋되었습니다.", "success"); return;
+        }
+        if (!user) return;
+        try {
+          await setDoc(doc(db,'artifacts',appId,'public','data','busState','status'), baseReset);
+          setShowResetModal(false); triggerNotification("모든 예약 정보가 초기화되었습니다.", "success");
+        } catch { triggerNotification("초기화에 실패했습니다.", "error"); }
+      };
+
+      const getSeatStatus = (num) => {
+        const seat = dbState.seats[num];
+        if (seat) return { occupied:!!seat.occupiedBy, name:seat.occupiedBy||null, seq:seat.seq||null, blocked:!!seat.blocked };
+        return { occupied:false, blocked:false };
+      };
+
+      function renderSeatButton(num) {
+        const status = getSeatStatus(num);
+        const isMySeat = status.occupied && status.seq === mySeq;
+        const isOther  = status.occupied && !isMySeat;
+        if (status.blocked) return (
+          <button key={num} onClick={()=>handleSeatClick(num)} className={`aspect-square rounded-xl flex flex-col items-center justify-center border transition-all ${isAdminMode?'bg-red-50 hover:bg-red-100 border-red-300 text-red-700':'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed bg-diagonal-stripes'}`}>
+            <span className="text-[10px] font-bold">🔒</span><span className="text-xs font-bold">불가</span><span className="text-[11px] font-semibold">{num}</span>
+          </button>
+        );
+        if (isMySeat) return (
+          <button key={num} onClick={()=>handleSeatClick(num)} className="aspect-square bg-amber-400 hover:bg-amber-500 text-amber-950 rounded-xl flex flex-col items-center justify-center border-2 border-amber-500 shadow-md transition-all scale-105">
+            <span className="text-[10px] uppercase font-black opacity-80">내자리</span><span className="text-xs font-black tracking-tighter truncate max-w-full px-1">{status.name}</span><span className="text-[14px] font-black">{num}</span>
+          </button>
+        );
+        if (isOther) return (
+          <button key={num} disabled={!isAdminMode} onClick={()=>handleSeatClick(num)} className="aspect-square bg-slate-200 text-slate-400 rounded-xl flex flex-col items-center justify-center border border-slate-300 cursor-not-allowed opacity-80">
+            <span className="text-[9px] font-bold line-through">완료</span><span className="text-[10px] font-bold truncate max-w-full px-1">{status.name}</span><span className="text-xs font-semibold">{num}</span>
+          </button>
+        );
+        return (
+          <button key={num} onClick={()=>handleSeatClick(num)} className={`aspect-square rounded-xl flex flex-col items-center justify-center border shadow-sm hover:shadow transition-all duration-200 ${isAdminMode?'bg-amber-50/70 border-amber-300 hover:bg-amber-100 text-amber-800':'bg-white hover:bg-emerald-50 text-slate-700 hover:text-emerald-700 border-slate-300 hover:border-emerald-400'}`}>
+            <span className="text-[10px] text-slate-400 font-medium">{isAdminMode?'잠금대기':'시트'}</span><span className="text-base font-extrabold">{num}</span>
+          </button>
+        );
+      }
+
+      const currentActiveMember = dbState.members.find(m => m.seq===dbState.currentTurn);
+      const timerMax = dbState.timerDuration || 60;
+      const progressPercent = Math.min(100, (timeLeft/timerMax)*100);
+
+      return (
+        <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col font-sans">
+          <header className="bg-emerald-600 text-white shadow-md py-4 px-6 sticky top-0 z-10 flex flex-col sm:flex-row justify-between items-center gap-4">
+            <div className="flex items-center gap-3">
+              <div className="p-2 bg-emerald-700 rounded-lg text-2xl">🚌</div>
+              <div>
+                <h1 className="text-xl font-bold tracking-tight">산행산악회 주왕산 버스 예약</h1>
+                <p className="text-xs text-emerald-100 mt-0.5">네이버 밴드 채팅방 전용 실시간 시스템</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              {mySeq ? (
+                <div className="flex items-center gap-2 bg-emerald-800 px-3 py-1.5 rounded-lg text-sm border border-emerald-500">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                  <span>본인: <strong>{dbState.members.find(m=>m.seq===mySeq)?.name}</strong> ({mySeq}순위)</span>
+                  <button onClick={handleLogout} className="ml-2 text-xs bg-red-500 hover:bg-red-600 px-2 py-1 rounded transition">해제</button>
+                </div>
+              ) : (
+                <span className="text-sm text-emerald-100 bg-emerald-700/50 px-3 py-1.5 rounded-lg font-medium">⚠️ 아래 명단에서 내 이름을 터치해 주세요!</span>
+              )}
+            </div>
+          </header>
+
+          {loading && <div className="w-full bg-emerald-200 h-1 overflow-hidden"><div className="bg-emerald-600 h-full w-1/3 animate-pulse"></div></div>}
+
+          {notification && (
+            <div className="fixed top-20 right-4 left-4 sm:left-auto sm:w-96 z-50 animate-bounce">
+              <div className={`p-4 rounded-xl shadow-2xl border text-white flex items-center gap-3 ${notification.type==='success'?'bg-emerald-600 border-emerald-400':notification.type==='warning'?'bg-amber-500 border-amber-300':notification.type==='error'?'bg-red-600 border-red-400':'bg-slate-800 border-slate-600'}`}>
+                <span className="text-xl">{notification.type==='success'?'✅':notification.type==='warning'?'⚠️':'❌'}</span>
+                <p className="text-sm font-medium">{notification.message}</p>
+              </div>
+            </div>
+          )}
+
+          {errorMsg && <div className="bg-red-50 border border-red-200 text-red-800 p-4 m-4 rounded-xl text-center">⚠️ {errorMsg}</div>}
+
+          <div className="bg-white border-b border-slate-200 px-4 py-3 flex flex-col md:flex-row items-center justify-between gap-4">
+            <div className="flex flex-col items-start gap-1">
+              <div className="flex items-center gap-2 text-xs text-slate-500">
+                <span className="bg-emerald-50 text-emerald-700 font-bold px-2 py-1 rounded">BAND 전용 툴</span>
+                <span>채팅방에 예약을 공유하고 회원들을 소환하세요!</span>
+              </div>
+              {dbState.customShareUrl ? <span className="text-[11px] text-emerald-600 font-medium">연동 주소: {dbState.customShareUrl}</span> : <span className="text-[11px] text-amber-600 font-medium">⚠️ 공유용 진짜 도메인 주소를 명단수정에서 꼭 등록해 주세요.</span>}
+            </div>
+            <div className="flex flex-wrap items-center gap-2 w-full md:w-auto">
+              <button onClick={()=>{ if(isAdminMode){ setIsAdminMode(false); triggerNotification("관리자 모드가 비활성화되었습니다. 일반 예약 모드로 전환됩니다.","info"); } else { setPasswordInput(''); setPasswordError(false); setShowPasswordModal(true); } }}
+                className={`flex-1 sm:flex-none text-xs font-bold px-4 py-2.5 rounded-lg transition shadow-sm border ${isAdminMode?'bg-amber-50/50 text-amber-800 border-amber-600 hover:bg-amber-100':'bg-white hover:bg-slate-50 text-slate-700 border-slate-300'}`}>
+                {isAdminMode?'🔓 관리자 모드 ON (좌석 잠금가능)':'🔒 관리자 모드 OFF'}
+              </button>
+              <button onClick={handleCopyBandShareLink} className="flex-1 sm:flex-none bg-emerald-500 hover:bg-emerald-600 text-white font-bold text-xs px-4 py-2.5 rounded-lg transition flex items-center justify-center gap-2 shadow-sm">
+                <span>📋 밴드 대화방 공유 메시지 복사</span>
+              </button>
+            </div>
+          </div>
+
+          <main className="flex-1 max-w-7xl w-full mx-auto p-4 lg:p-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
+            <section className="lg:col-span-5 flex flex-col gap-6">
+              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 text-center relative overflow-hidden">
+                <div className="absolute top-0 left-0 right-0 h-2 bg-emerald-500"></div>
+                <h2 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-2">실시간 선택 차례</h2>
+                {dbState.currentTurn <= 16 ? (
+                  <div>
+                    <div className="inline-flex items-center gap-2 bg-emerald-50 text-emerald-700 px-4 py-1.5 rounded-full text-sm font-bold mb-3">
+                      <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping"></span>현재 {dbState.currentTurn}순위 예약 중
+                    </div>
+                    <h3 className="text-3xl font-extrabold text-slate-800 tracking-tight">{currentActiveMember?currentActiveMember.name:`${dbState.currentTurn}번 회원`}</h3>
+                    <div className="mt-5 max-w-xs mx-auto">
+                      <div className="flex justify-between text-xs font-semibold text-slate-500 mb-1">
+                        <span>⏰ 남은 시간</span>
+                        <span className={timeLeft<=10?"text-red-500 font-extrabold animate-pulse":"text-emerald-600 font-bold"}>{formatTimeLeft(timeLeft)}</span>
+                      </div>
+                      <div className="w-full bg-slate-100 h-3 rounded-full overflow-hidden border border-slate-200">
+                        <div className={`h-full transition-all duration-1000 ${timeLeft<=10?"bg-red-500 animate-pulse":"bg-emerald-500"}`} style={{width:`${progressPercent}%`}}></div>
+                      </div>
+                      <p className="text-sm font-extrabold text-red-500 mt-3 tracking-tight animate-pulse leading-snug">⚠️ 시간이 모두 지나면 딱 한 순번 밀려나 바로 다음 차례 회원 뒤에 배치됩니다.</p>
+                    </div>
+                    {isAdminMode && <button onClick={handleSkipTurn} className="mt-4 bg-amber-100 hover:bg-amber-200 text-amber-800 font-bold text-xs px-3 py-2 rounded-xl transition">⏩ 강제 패스 (현재 차례 1순번 뒤로 미루기)</button>}
+                  </div>
+                ) : (
+                  <div>
+                    <span className="inline-flex items-center gap-2 bg-blue-50 text-blue-700 px-4 py-1.5 rounded-full text-sm font-bold mb-3">🎉 예약 완료!</span>
+                    <h3 className="text-2xl font-bold text-slate-800">모든 회원 예약 완료</h3>
+                    <p className="text-xs text-slate-500 mt-2">모든 인원의 예약이 성공적으로 마무리되었습니다.</p>
+                  </div>
+                )}
+              </div>
+
+              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 flex-1 flex flex-col min-h-[350px]">
+                <div className="flex justify-between items-center mb-4">
+                  <h2 className="text-lg font-bold text-slate-800">👥 회원 예약 현황 및 본인 선택</h2>
+                  {!isEditingNames ? (
+                    isAdminMode && <button onClick={startEditingNames} className="text-xs text-emerald-600 hover:text-emerald-700 font-semibold bg-emerald-50 px-2.5 py-1.5 rounded-lg transition">✏️ 명단/설정 수정</button>
+                  ) : (
+                    <div className="flex gap-1">
+                      <button onClick={saveEditedNames} className="text-xs bg-emerald-600 text-white font-semibold px-2.5 py-1.5 rounded-lg hover:bg-emerald-700 transition">저장</button>
+                      <button onClick={()=>setIsEditingNames(false)} className="text-xs bg-slate-200 text-slate-600 font-semibold px-2.5 py-1.5 rounded-lg hover:bg-slate-300 transition">취소</button>
+                    </div>
+                  )}
+                </div>
+                {isEditingNames && (
+                  <div className="mb-4 p-4 bg-emerald-50 rounded-xl border border-emerald-100 flex flex-col gap-3">
+                    <div>
+                      <label className="block text-xs font-bold text-emerald-800 mb-1">🔗 밴드 공유용 실제 주소 (URL)</label>
+                      <input type="text" placeholder="예: https://my-mountain-bus.netlify.app" value={tempShareUrl} onChange={e=>setTempShareUrl(e.target.value)} className="w-full text-xs p-2 border border-emerald-300 rounded bg-white" />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-bold text-emerald-800 mb-2">⏱️ 회원당 선택 제한 시간 설정 (최대 12시간)</label>
+                      <div className="grid grid-cols-3 gap-2">
+                        <div><span className="text-[10px] text-slate-400 block mb-0.5">시간 (0~12)</span><input type="number" min="0" max="12" value={tempHours} onChange={e=>setTempHours(Math.max(0,Math.min(12,parseInt(e.target.value)||0)))} className="w-full text-xs p-2 border border-emerald-300 rounded text-center bg-white" /></div>
+                        <div><span className="text-[10px] text-slate-400 block mb-0.5">분 (0~59)</span><input type="number" min="0" max="59" value={tempMinutes} onChange={e=>setTempMinutes(Math.max(0,Math.min(59,parseInt(e.target.value)||0)))} className="w-full text-xs p-2 border border-emerald-300 rounded text-center bg-white" /></div>
+                        <div><span className="text-[10px] text-slate-400 block mb-0.5">초 (0~59)</span><input type="number" min="0" max="59" value={tempSeconds} onChange={e=>setTempSeconds(Math.max(0,Math.min(59,parseInt(e.target.value)||0)))} className="w-full text-xs p-2 border border-emerald-300 rounded text-center bg-white" /></div>
+                      </div>
+                    </div>
+                    <p className="text-[10px] text-emerald-600">※ 설정을 저장하면 새로운 대기자부터 반영되며 전체 타이머가 새로 초기화됩니다.</p>
+                    <div className="border-t border-emerald-200 pt-3">
+                      <label className="block text-xs font-bold text-amber-700 mb-2">🔐 관리자 비밀번호 변경 (변경 시에만 입력)</label>
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <span className="text-[10px] text-slate-400 block mb-0.5">새 비밀번호</span>
+                          <input type="password" placeholder="새 비밀번호" value={tempAdminPassword} onChange={e=>setTempAdminPassword(e.target.value)} className="w-full text-xs p-2 border border-amber-300 rounded bg-white" />
+                        </div>
+                        <div>
+                          <span className="text-[10px] text-slate-400 block mb-0.5">비밀번호 확인</span>
+                          <input type="password" placeholder="다시 입력" value={tempAdminPasswordConfirm} onChange={e=>setTempAdminPasswordConfirm(e.target.value)} className="w-full text-xs p-2 border border-amber-300 rounded bg-white" />
+                        </div>
+                      </div>
+                      <p className="text-[10px] text-amber-600 mt-1">※ 현재 비밀번호: {"*".repeat(adminPassword.length)} / 변경하지 않으려면 빈칸으로 두세요.</p>
+                    </div>
+                  </div>
+                )}
+                <p className="text-xs text-slate-500 mb-4 leading-relaxed">본인의 성함을 클릭하여 접속자 인증을 진행해 주세요. 본인 차례에만 좌석 예약이 허용됩니다.</p>
+                <div className="grid grid-cols-2 gap-2 overflow-y-auto max-h-[400px] pr-1 flex-1">
+                  {dbState.members.map((member) => {
+                    const isMySelection = mySeq===member.seq, isHisTurn = dbState.currentTurn===member.seq, hasSeat = member.seat!==null;
+                    return (
+                      <div key={member.seq} onClick={()=>!isEditingNames&&handleSelectMyIdentity(member.seq)}
+                        className={`p-3 rounded-xl border transition-all flex flex-col justify-between cursor-pointer group relative overflow-hidden ${isEditingNames?'cursor-default border-slate-200 bg-slate-50':isMySelection?'border-emerald-500 bg-emerald-50 ring-2 ring-emerald-500/20':isHisTurn?'border-amber-400 bg-amber-50/70 animate-pulse':'border-slate-100 hover:border-slate-300 bg-white hover:shadow-sm'}`}>
+                        {hasSeat && <div className="absolute top-1 right-2 text-[10px] bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded-full font-semibold">{member.seat}번 시트</div>}
+                        <div className="flex items-center gap-2">
+                          <span className={`text-xs font-bold w-5 h-5 rounded-full flex items-center justify-center ${isHisTurn?'bg-amber-400 text-amber-950':'bg-slate-100 text-slate-600'}`}>{member.seq}</span>
+                          {isEditingNames ? (
+                            <input type="text" value={tempNames[member.seq]||''} onChange={e=>setTempNames({...tempNames,[member.seq]:e.target.value})} className="w-full text-xs font-semibold px-1 py-0.5 border border-slate-300 rounded" />
+                          ) : (
+                            <span className="text-sm font-bold text-slate-700">{member.name}</span>
+                          )}
+                        </div>
+                        <div className="mt-2 flex justify-between items-center text-[11px]">
+                          <span className={`font-semibold ${hasSeat?'text-slate-400':isHisTurn?'text-amber-700':'text-slate-400'}`}>{hasSeat?'예약완료':isHisTurn?'🚨 현재차례':'선택대기'}</span>
+                          {!isEditingNames && <span className="opacity-0 group-hover:opacity-100 text-emerald-600 font-bold transition text-[10px]">선택하기 →</span>}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </section>
+
+            <section className="lg:col-span-7 flex flex-col gap-4">
+              <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 flex flex-col items-center">
+                <div className="w-full border-b border-slate-100 pb-3 mb-6 flex justify-between items-center">
+                  <div>
+                    <h2 className="text-lg font-bold text-slate-800">💺 19인승 실시간 버스 평면도</h2>
+                    <p className="text-xs text-slate-400">버스의 앞부분이 윗방향입니다.</p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <span className="inline-flex items-center gap-1.5 text-xs text-slate-500"><span className="w-3 h-3 rounded bg-slate-100 border border-slate-200"></span> 대기</span>
+                    <span className="inline-flex items-center gap-1.5 text-xs text-slate-500"><span className="w-3 h-3 rounded bg-red-400"></span> 불가</span>
+                    <span className="inline-flex items-center gap-1.5 text-xs text-slate-500"><span className="w-3 h-3 rounded bg-emerald-500"></span> 완료</span>
+                    <span className="inline-flex items-center gap-1.5 text-xs text-slate-500"><span className="w-3 h-3 rounded bg-amber-400"></span> 내자리</span>
+                  </div>
+                </div>
+                <div className={`relative w-full max-w-lg p-6 rounded-[3rem] border-4 shadow-inner transition-all duration-300 ${isAdminMode?'bg-amber-50/50 border-amber-400 ring-4 ring-amber-400/20':'bg-slate-100 border-slate-300'}`}>
+                  {isAdminMode && <div className="absolute top-2 left-1/2 transform -translate-x-1/2 bg-amber-500 text-white text-[10px] font-bold px-3 py-1 rounded-full shadow-md animate-pulse z-20">🚨 관리자 잠금설정 활성화 중 (시트를 터치하여 예약 제한)</div>}
+                  <div className="grid grid-cols-5 gap-3 mb-8 text-center font-bold text-sm text-slate-500">
+                    <div className="col-span-2 bg-slate-200 py-3 rounded-xl border border-slate-300 shadow-sm flex items-center justify-center">🕶️ 운전석</div>
+                    <div className="col-span-1 flex items-center justify-center text-xs text-slate-400">↑ 앞쪽</div>
+                    <div className="col-span-2 bg-emerald-100 text-emerald-800 py-3 rounded-xl border border-emerald-200 shadow-sm flex items-center justify-center">🚪 출입문</div>
+                  </div>
+                  <div className="absolute inset-0 pointer-events-none p-6 z-0">
+                    <div className="w-full h-full grid grid-cols-5 gap-3">
+                      <div className="col-span-2"></div>
+                      <div className="col-span-1 flex flex-col justify-start items-center h-[80%] pt-12">
+                        <div className="w-0.5 bg-slate-300 h-full relative flex justify-center items-center">
+                          <div className="absolute flex flex-col items-center gap-2 bg-slate-100/90 px-2 py-3 rounded-full border border-slate-200 shadow-sm">
+                            <span className="text-slate-400 text-sm animate-pulse">⬇️</span>
+                            <svg width="12" height="60" className="opacity-60">
+                              <text x="6" y="10" fill="#64748b" fontSize="8" fontWeight="bold" textAnchor="middle">통</text>
+                              <text x="6" y="26" fill="#64748b" fontSize="8" fontWeight="bold" textAnchor="middle">로</text>
+                              <text x="6" y="42" fill="#64748b" fontSize="8" fontWeight="bold" textAnchor="middle">방</text>
+                              <text x="6" y="58" fill="#64748b" fontSize="8" fontWeight="bold" textAnchor="middle">향</text>
+                            </svg>
+                          </div>
+                        </div>
+                      </div>
+                      <div className="col-span-2"></div>
+                    </div>
+                  </div>
+                  <div className="relative z-10 flex flex-col gap-4">
+                    <div className="grid grid-cols-5 gap-3">{renderSeatButton(1)}{renderSeatButton(2)}<div></div>{renderSeatButton(3)}<div className="border border-dashed border-slate-200 rounded-xl"></div></div>
+                    <div className="grid grid-cols-5 gap-3">{renderSeatButton(4)}{renderSeatButton(5)}<div></div>{renderSeatButton(6)}<div className="border border-dashed border-slate-200 rounded-xl"></div></div>
+                    <div className="grid grid-cols-5 gap-3">{renderSeatButton(7)}{renderSeatButton(8)}<div></div>{renderSeatButton(9)}<div className="border border-dashed border-slate-200 rounded-xl"></div></div>
+                    <div className="grid grid-cols-5 gap-3">{renderSeatButton(10)}{renderSeatButton(11)}<div></div>{renderSeatButton(12)}<div className="border border-dashed border-slate-200 rounded-xl"></div></div>
+                    <div className="grid grid-cols-5 gap-3">{renderSeatButton(13)}{renderSeatButton(14)}<div></div>{renderSeatButton(15)}<div className="border border-dashed border-slate-200 rounded-xl"></div></div>
+                    <div className="grid grid-cols-5 gap-3">{renderSeatButton(16)}{renderSeatButton(17)}{renderSeatButton(18)}{renderSeatButton(19)}<div className="border border-dashed border-slate-200 rounded-xl"></div></div>
+                  </div>
+                </div>
+                {isAdminMode && (
+                  <div className="mt-8 pt-4 border-t border-slate-100 w-full flex justify-end">
+                    <button onClick={()=>setShowResetModal(true)} className="text-xs bg-rose-50 hover:bg-rose-100 text-rose-600 font-bold px-4 py-2 rounded-xl transition">🔄 전체 예약 초기화 (다시 시작)</button>
+                  </div>
+                )}
+              </div>
+            </section>
+          </main>
+
+          {showPasswordModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
+              <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl border border-slate-100 animate-scale-up">
+                <h3 className="text-lg font-bold text-amber-700 mb-1">🔐 관리자 인증</h3>
+                <p className="text-sm text-slate-500 mb-4">관리자 비밀번호를 입력해 주세요.</p>
+                <input
+                  type="password"
+                  value={passwordInput}
+                  onChange={e=>{ setPasswordInput(e.target.value); setPasswordError(false); }}
+                  onKeyDown={e=>{ if(e.key==='Enter'){ if(passwordInput===adminPassword){ setIsAdminMode(true); setShowPasswordModal(false); triggerNotification("관리자 모드가 켜졌습니다. 좌석을 터치해 선택 불가(잠금) 상태로 만들 수 있습니다.","info"); } else { setPasswordError(true); } } }}
+                  placeholder="비밀번호 입력"
+                  className={`w-full text-sm p-3 border rounded-xl mb-2 focus:outline-none ${passwordError?'border-red-400 bg-red-50':'border-slate-300'}`}
+                  autoFocus
+                />
+                {passwordError && <p className="text-xs text-red-500 mb-3">⚠️ 비밀번호가 올바르지 않습니다.</p>}
+                <div className="flex gap-3 justify-end mt-2">
+                  <button onClick={()=>setShowPasswordModal(false)} className="px-4 py-2 rounded-xl bg-slate-100 text-slate-600 text-sm font-semibold hover:bg-slate-200 transition">취소</button>
+                  <button onClick={()=>{ if(passwordInput===adminPassword){ setIsAdminMode(true); setShowPasswordModal(false); triggerNotification("관리자 모드가 켜졌습니다. 좌석을 터치해 선택 불가(잠금) 상태로 만들 수 있습니다.","info"); } else { setPasswordError(true); } }} className="px-4 py-2 rounded-xl bg-amber-500 text-white text-sm font-semibold hover:bg-amber-600 transition">확인</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {showResetModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
+              <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-100 animate-scale-up">
+                <h3 className="text-lg font-bold text-slate-900 mb-2">🚫 전체 예약을 초기화할까요?</h3>
+                <p className="text-sm text-slate-500 mb-6 leading-relaxed">모든 회원의 시트 지정 정보가 완전히 삭제되고 1순위 회원부터 예약을 다시 시작하게 됩니다. 해당 작업을 진행하시겠습니까?</p>
+                <div className="flex gap-3 justify-end">
+                  <button onClick={()=>setShowResetModal(false)} className="px-4 py-2 rounded-xl bg-slate-100 text-slate-600 text-sm font-semibold hover:bg-slate-200 transition">돌아가기</button>
+                  <button onClick={handleReset} className="px-4 py-2 rounded-xl bg-red-600 text-white text-sm font-semibold hover:bg-red-700 transition">확인 (초기화)</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {showCancelModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
+              <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-100 animate-scale-up">
+                <h3 className="text-lg font-bold text-slate-900 mb-2">🛑 좌석 예약을 취소할까요?</h3>
+                <p className="text-sm text-slate-500 mb-6 leading-relaxed">선택하신 <strong>{targetCancelSeat}번 좌석</strong>의 예약을 완전히 철회합니다. 예약을 취소하면 본인의 대기 차례가 다시 돌아오게 됩니다.</p>
+                <div className="flex gap-3 justify-end">
+                  <button onClick={()=>{setShowCancelModal(false);setTargetCancelSeat(null);}} className="px-4 py-2 rounded-xl bg-slate-100 text-slate-600 text-sm font-semibold hover:bg-slate-200 transition">돌아가기</button>
+                  <button onClick={handleCancelReservation} className="px-4 py-2 rounded-xl bg-red-600 text-white text-sm font-semibold hover:bg-red-700 transition">확인 (예약 취소)</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {showConfirmModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
+              <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-100 animate-scale-up">
+                <h3 className="text-lg font-bold text-emerald-700 mb-2">📌 좌석 예약을 확정하시겠습니까?</h3>
+                <p className="text-sm text-slate-500 mb-6 leading-relaxed">선택하신 <strong>{targetConfirmSeat}번 좌석</strong>으로 지정을 완료합니다. 확정하시면 차례가 다음 사람으로 넘어가며 전송용 카피 메시지가 생성됩니다.</p>
+                <div className="flex gap-3 justify-end">
+                  <button onClick={()=>{setShowConfirmModal(false);setTargetConfirmSeat(null);}} className="px-4 py-2 rounded-xl bg-slate-100 text-slate-600 text-sm font-semibold hover:bg-slate-200 transition">취소 (다시 선택)</button>
+                  <button onClick={handleConfirmReservation} className="px-4 py-2 rounded-xl bg-emerald-600 text-white text-sm font-semibold hover:bg-emerald-700 transition">확정 (예약 완료)</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <footer className="bg-slate-900 text-slate-400 py-6 text-center text-xs border-t border-slate-800">
+            <p>© 명품 산악회 동반 여행 - 안전하고 편안한 버스 투어를 위해 지정 좌석제를 시행합니다.</p>
+            <p className="mt-1 text-slate-600">본 어플리케이션은 실시간 클라우드 DB 연동으로 모든 예약 데이터를 보호합니다.</p>
+          </footer>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
